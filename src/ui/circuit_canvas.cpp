@@ -9,6 +9,7 @@
 #include "../../include/core/command_system.h"
 #include <wx/dcbuffer.h>
 #include <cmath>
+#include <algorithm>
 
 // Define custom event
 const wxEventType CircuitCanvas::wxEVT_COMPONENT_SELECTED = wxNewEventType();
@@ -23,6 +24,11 @@ wxBEGIN_EVENT_TABLE(CircuitCanvas, wxWindow)
     EVT_MIDDLE_DOWN(CircuitCanvas::OnMiddleDown)
     EVT_MIDDLE_UP(CircuitCanvas::OnMiddleUp)
     EVT_KEY_DOWN(CircuitCanvas::OnKeyDown)
+
+    // Menu events for accelerator table
+    EVT_MENU(wxID_UNDO, CircuitCanvas::OnUndoCommand)
+    EVT_MENU(wxID_REDO, CircuitCanvas::OnRedoCommand)
+    EVT_MENU(wxID_DELETE, CircuitCanvas::OnDeleteCommand)
 wxEND_EVENT_TABLE()
 
 CircuitCanvas::CircuitCanvas(wxWindow* parent)
@@ -30,6 +36,8 @@ CircuitCanvas::CircuitCanvas(wxWindow* parent)
               wxFULL_REPAINT_ON_RESIZE | wxWANTS_CHARS),
       selectedComponent(nullptr),
       currentTool(ComponentType::SELECT),
+      dragStart(0, 0),
+      dragStartPos(0, 0),
       isDragging(false),
       isPanning(false),
       zoomFactor(1.0),
@@ -43,6 +51,17 @@ CircuitCanvas::CircuitCanvas(wxWindow* parent)
 
     SetBackgroundStyle(wxBG_STYLE_PAINT);
     SetCanFocus(true);
+
+    // Set up accelerator table for keyboard shortcuts
+    wxAcceleratorEntry entries[5];
+    entries[0].Set(wxACCEL_CTRL, (int) 'Z', wxID_UNDO);
+    entries[1].Set(wxACCEL_CTRL, (int) 'Y', wxID_REDO);
+    entries[2].Set(wxACCEL_CTRL | wxACCEL_SHIFT, (int) 'Z', wxID_REDO);
+    entries[3].Set(wxACCEL_NORMAL, WXK_DELETE, wxID_DELETE);
+    entries[4].Set(wxACCEL_NORMAL, WXK_BACK, wxID_DELETE);
+
+    wxAcceleratorTable accel(5, entries);
+    SetAcceleratorTable(accel);
 }
 
 void CircuitCanvas::OnPaint(wxPaintEvent& event) {
@@ -84,56 +103,100 @@ void CircuitCanvas::OnPaint(wxPaintEvent& event) {
 
 void CircuitCanvas::OnLeftDown(wxMouseEvent& event) {
     SetFocus(); // Ensure canvas can receive keyboard events
+    CaptureMouse(); // Capture mouse for proper dragging
+
+    // Reset panning state on left click - this ensures left click always works for selection/dragging
+    isPanning = false;
+    SetCursor(wxCursor(wxCURSOR_DEFAULT));
+
     wxPoint screenPos = event.GetPosition();
     wxPoint worldPos = ScreenToWorld(screenPos);
 
+    wxLogDebug("OnLeftDown: screenPos=(%d,%d), worldPos=(%d,%d), currentTool=%d",
+              screenPos.x, screenPos.y, worldPos.x, worldPos.y, (int)currentTool);
+
     // Check if we're clicking on a component
-    selectedComponent = nullptr;
+    CircuitComponent* clickedComponent = nullptr;
     for (auto it = components.rbegin(); it != components.rend(); ++it) {
         if ((*it)->Contains(worldPos)) {
-            selectedComponent = it->get();
+            clickedComponent = it->get();
+            wxLogDebug("Clicked on component at (%d,%d)", clickedComponent->GetPosition().x, clickedComponent->GetPosition().y);
             break;
         }
     }
 
-    // Deselect all components
+    if (!clickedComponent) {
+        wxLogDebug("No component clicked at world position (%d,%d)", worldPos.x, worldPos.y);
+    }
+
+    // Deselect all components first
     for (auto& component : components) {
         component->Select(false);
     }
 
-    if (selectedComponent) {
-        selectedComponent->Select(true);
+    if (clickedComponent) {
+        // Select the clicked component
+        SelectComponent(clickedComponent);
 
-        // Check if clicked on a pin
-        Pin* pin = selectedComponent->GetPinAt(worldPos);
-        if (pin && currentTool == ComponentType::WIRE) {
-            // Start creating a wire
-            currentWire = std::make_unique<Wire>(pin);
-            pin->isConnected = true;
-        } else {
-            // Start dragging the component
-            dragStart = screenPos;
+        // Handle different tools
+        if (currentTool == ComponentType::SELECT) {
+            // In SELECT mode, always allow dragging the component
+            // Store original position for undo system
+            dragStartPos = selectedComponent->GetPosition();
+            dragStart = worldPos; // Store world click position for delta calculation
             isDragging = true;
+
+            // Debug output
+            wxLogDebug("Starting drag: currentTool=%d, component at (%d, %d), mouse at (%d, %d), isDragging=%s",
+                      (int)currentTool, dragStartPos.x, dragStartPos.y, worldPos.x, worldPos.y,
+                      isDragging ? "true" : "false");
+
+        } else if (currentTool == ComponentType::WIRE) {
+            // Wire tool - check for pin connection
+            Pin* pin = selectedComponent->GetPinAt(worldPos);
+            if (pin) {
+                // Start creating a wire from this pin
+                currentWire = std::make_unique<Wire>(pin);
+                pin->isConnected = true;
+            }
         }
-    } else {
+    } else if (currentTool != ComponentType::SELECT && currentTool != ComponentType::WIRE) {
         // Create a new component based on the current tool
         wxPoint gridPos = snapToGrid ? SnapToGrid(worldPos) : worldPos;
         CircuitComponent* newComponent = CreateComponent(currentTool, gridPos);
         if (newComponent) {
-            components.push_back(std::unique_ptr<CircuitComponent>(newComponent));
-            selectedComponent = components.back().get();
-            selectedComponent->Select(true);
+            // Use command system for undo/redo support
+            auto addCommand = std::make_unique<AddComponentCommand>(this,
+                std::unique_ptr<CircuitComponent>(newComponent));
+            commandManager.ExecuteCommand(std::move(addCommand));
+
+            // Select the newly created component
+            SelectComponent(newComponent);
         }
+    } else {
+        // Clicked on empty space - clear selection
+        ClearSelection();
     }
 
     Refresh();
 }
 
 void CircuitCanvas::OnLeftUp(wxMouseEvent& event) {
+    if (HasCapture()) {
+        ReleaseMouse(); // Release mouse capture
+    }
+
     wxPoint screenPos = event.GetPosition();
     wxPoint worldPos = ScreenToWorld(screenPos);
 
-    if (isDragging) {
+    if (isDragging && selectedComponent) {
+        // Create a move command for undo/redo support
+        wxPoint currentPos = selectedComponent->GetPosition();
+        if (dragStartPos != currentPos) { // Only create command if component actually moved
+            auto moveCommand = std::make_unique<MoveComponentCommand>(
+                selectedComponent, dragStartPos, currentPos);
+            commandManager.ExecuteCommand(std::move(moveCommand));
+        }
         isDragging = false;
     }
 
@@ -167,6 +230,15 @@ void CircuitCanvas::OnMouseMove(wxMouseEvent& event) {
     wxPoint screenPos = event.GetPosition();
     wxPoint worldPos = ScreenToWorld(screenPos);
 
+    // Debug output for mouse move
+    static int debugCounter = 0;
+    if (++debugCounter % 10 == 0) { // Only print every 10th move to avoid spam
+        wxLogDebug("OnMouseMove: isPanning=%s, isDragging=%s, selectedComponent=%s",
+                  isPanning ? "true" : "false",
+                  isDragging ? "true" : "false",
+                  selectedComponent ? "valid" : "null");
+    }
+
     if (isPanning) {
         // Pan the view
         wxPoint delta = screenPos - lastPanPoint;
@@ -177,19 +249,30 @@ void CircuitCanvas::OnMouseMove(wxMouseEvent& event) {
     }
 
     if (isDragging && selectedComponent) {
-        // Move the selected component
-        wxPoint screenDelta = screenPos - dragStart;
-        wxPoint worldDelta(screenDelta.x / zoomFactor, screenDelta.y / zoomFactor);
+        // Calculate the total offset from the original drag start position
+        wxPoint totalOffset = worldPos - dragStart;
+        wxPoint targetPos = dragStartPos + totalOffset;
 
+        // Apply grid snapping if enabled
         if (snapToGrid) {
-            wxPoint currentPos = selectedComponent->GetPosition();
-            wxPoint newPos = SnapToGrid(currentPos + worldDelta);
-            worldDelta = newPos - currentPos;
+            targetPos = SnapToGrid(targetPos);
         }
 
-        selectedComponent->Move(worldDelta);
-        dragStart = screenPos;
-        Refresh();
+        // Calculate the offset needed to reach the target position
+        wxPoint currentPos = selectedComponent->GetPosition();
+        wxPoint moveOffset = targetPos - currentPos;
+
+        // Debug output
+        wxLogDebug("Dragging: worldPos=(%d,%d), dragStart=(%d,%d), dragStartPos=(%d,%d), totalOffset=(%d,%d), targetPos=(%d,%d), currentPos=(%d,%d), moveOffset=(%d,%d)",
+                  worldPos.x, worldPos.y, dragStart.x, dragStart.y, dragStartPos.x, dragStartPos.y,
+                  totalOffset.x, totalOffset.y, targetPos.x, targetPos.y, currentPos.x, currentPos.y, moveOffset.x, moveOffset.y);
+
+        // Move the component by the calculated offset
+        if (moveOffset.x != 0 || moveOffset.y != 0) {
+            selectedComponent->Move(moveOffset);
+            wxLogDebug("Component moved by offset (%d,%d)", moveOffset.x, moveOffset.y);
+            Refresh();
+        }
     }
 
     if (currentWire) {
@@ -200,11 +283,12 @@ void CircuitCanvas::OnMouseMove(wxMouseEvent& event) {
 }
 
 void CircuitCanvas::OnRightDown(wxMouseEvent& event) {
-    wxPoint pos = event.GetPosition();
+    wxPoint screenPos = event.GetPosition();
+    wxPoint worldPos = ScreenToWorld(screenPos);
 
     // Check if we clicked on a switch
     for (auto& component : components) {
-        if (component->GetType() == ComponentType::INPUT_PIN && component->Contains(pos)) {
+        if (component->GetType() == ComponentType::INPUT_PIN && component->Contains(worldPos)) {
             // Toggle the switch
             static_cast<InputSwitch*>(component.get())->Toggle();
             SimulateCircuit();
@@ -215,7 +299,22 @@ void CircuitCanvas::OnRightDown(wxMouseEvent& event) {
 }
 
 void CircuitCanvas::SetTool(ComponentType tool) {
+    wxLogDebug("CircuitCanvas::SetTool: changing from %d to %d", (int)currentTool, (int)tool);
+    ComponentType oldTool = currentTool;
     currentTool = tool;
+
+    // Reset ongoing operations when tool changes, but only if it's actually changing
+    if (oldTool != tool) {
+        isDragging = false;
+        isPanning = false;
+        // Only clear selection if switching away from SELECT tool
+        if (oldTool == ComponentType::SELECT && tool != ComponentType::SELECT) {
+            ClearSelection();
+        }
+        currentWire = nullptr;
+    }
+
+    wxLogDebug("CircuitCanvas::SetTool: currentTool is now %d (SELECT=%d)", (int)currentTool, (int)ComponentType::SELECT);
 }
 
 CircuitComponent* CircuitCanvas::CreateComponent(ComponentType type, const wxPoint& pos) {
@@ -261,7 +360,7 @@ CircuitComponent* CircuitCanvas::CreateComponent(ComponentType type, const wxPoi
             return new SRLatch(pos);
         case ComponentType::CLOCK_GENERATOR:
             return new ClockGenerator(pos);
-        // Only include implemented components for now
+        // Encoder/Decoder components
         case ComponentType::DECODER_3TO8:
             return new Decoder3to8(pos);
         case ComponentType::BCD_TO_7SEGMENT:
@@ -277,6 +376,7 @@ CircuitComponent* CircuitCanvas::CreateComponent(ComponentType type, const wxPoi
             return new HexDisplay(pos);
         case ComponentType::BINARY_DISPLAY:
             return new BinaryDisplay8Bit(pos);
+
         default:
             return nullptr;
     }
@@ -397,16 +497,12 @@ void CircuitCanvas::OnKeyDown(wxKeyEvent& event) {
     switch (keyCode) {
         case WXK_DELETE:
         case WXK_BACK:
-            // Delete selected component directly for now
+            // Delete selected component using command system
             if (selectedComponent) {
-                for (auto it = components.begin(); it != components.end(); ++it) {
-                    if (it->get() == selectedComponent) {
-                        components.erase(it);
-                        selectedComponent = nullptr;
-                        Refresh();
-                        break;
-                    }
-                }
+                auto deleteCommand = std::make_unique<RemoveComponentCommand>(this, selectedComponent);
+                commandManager.ExecuteCommand(std::move(deleteCommand));
+                selectedComponent = nullptr;
+                Refresh();
             }
             break;
 
@@ -483,9 +579,77 @@ void CircuitCanvas::OnKeyDown(wxKeyEvent& event) {
             }
             break;
 
+        case 'Z':
+        case 'z':
+            if (event.ControlDown()) {
+                if (event.ShiftDown()) {
+                    // Redo (Ctrl+Shift+Z)
+                    if (commandManager.CanRedo()) {
+                        commandManager.Redo();
+                        Refresh();
+                    }
+                } else {
+                    // Undo (Ctrl+Z)
+                    if (commandManager.CanUndo()) {
+                        commandManager.Undo();
+                        Refresh();
+                    }
+                }
+            }
+            break;
+
+        case 'Y':
+        case 'y':
+            if (event.ControlDown()) {
+                // Redo (Ctrl+Y)
+                if (commandManager.CanRedo()) {
+                    commandManager.Redo();
+                    Refresh();
+                }
+            }
+            break;
+
         default:
             event.Skip();
             break;
+    }
+}
+
+// Menu command handlers for accelerator table
+void CircuitCanvas::OnUndoCommand(wxCommandEvent& event) {
+    if (commandManager.CanUndo()) {
+        commandManager.Undo();
+        Refresh();
+    }
+}
+
+void CircuitCanvas::OnRedoCommand(wxCommandEvent& event) {
+    if (commandManager.CanRedo()) {
+        commandManager.Redo();
+        Refresh();
+    }
+}
+
+void CircuitCanvas::OnDeleteCommand(wxCommandEvent& event) {
+    // Delete selected component using command system
+    if (selectedComponent) {
+        auto deleteCommand = std::make_unique<RemoveComponentCommand>(this, selectedComponent);
+        commandManager.ExecuteCommand(std::move(deleteCommand));
+        selectedComponent = nullptr;
+
+        // Update status bar
+        wxWindow* parent = GetParent();
+        while (parent && !wxDynamicCast(parent, wxFrame)) {
+            parent = parent->GetParent();
+        }
+        if (parent) {
+            wxFrame* frame = wxDynamicCast(parent, wxFrame);
+            if (frame && frame->GetStatusBar()) {
+                frame->SetStatusText("Component deleted", 0);
+            }
+        }
+
+        Refresh();
     }
 }
 
@@ -577,6 +741,32 @@ void CircuitCanvas::SelectComponent(CircuitComponent* component) {
     selectedComponent = component;
     if (component) {
         component->Select(true);
+
+        // Debug: Update parent window's status bar if available
+        wxWindow* parent = GetParent();
+        while (parent && !wxDynamicCast(parent, wxFrame)) {
+            parent = parent->GetParent();
+        }
+        if (parent) {
+            wxFrame* frame = wxDynamicCast(parent, wxFrame);
+            if (frame && frame->GetStatusBar()) {
+                frame->SetStatusText(wxString::Format("Selected: Component at (%d, %d)",
+                                                    component->GetPosition().x,
+                                                    component->GetPosition().y), 0);
+            }
+        }
+    } else {
+        // Clear status when no component selected
+        wxWindow* parent = GetParent();
+        while (parent && !wxDynamicCast(parent, wxFrame)) {
+            parent = parent->GetParent();
+        }
+        if (parent) {
+            wxFrame* frame = wxDynamicCast(parent, wxFrame);
+            if (frame && frame->GetStatusBar()) {
+                frame->SetStatusText("No component selected", 0);
+            }
+        }
     }
 
     // Send selection event
@@ -715,6 +905,19 @@ std::unique_ptr<CircuitComponent> CircuitCanvas::ExtractComponent(CircuitCompone
     }
 
     return nullptr;
+}
+
+size_t CircuitCanvas::GetComponentIndex(CircuitComponent* component) const {
+    auto it = std::find_if(components.begin(), components.end(),
+        [component](const std::unique_ptr<CircuitComponent>& ptr) {
+            return ptr.get() == component;
+        });
+
+    if (it != components.end()) {
+        return std::distance(components.begin(), it);
+    }
+
+    return components.size(); // Return invalid index if not found
 }
 
 void CircuitCanvas::InsertComponentAt(size_t index, std::unique_ptr<CircuitComponent> component) {

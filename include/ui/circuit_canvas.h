@@ -14,6 +14,7 @@ private:
     CircuitComponent* selectedComponent;
     ComponentType currentTool;
     wxPoint dragStart;
+    wxPoint dragStartPos; // Original position of component when drag started
     bool isDragging;
     bool isPanning;
 
@@ -47,6 +48,11 @@ public:
     void OnMiddleDown(wxMouseEvent& event);
     void OnMiddleUp(wxMouseEvent& event);
     void OnKeyDown(wxKeyEvent& event);
+
+    // Menu command handlers for accelerator table
+    void OnUndoCommand(wxCommandEvent& event);
+    void OnRedoCommand(wxCommandEvent& event);
+    void OnDeleteCommand(wxCommandEvent& event);
 
     void SetTool(ComponentType tool);
     void SimulateCircuit();
@@ -97,8 +103,10 @@ public:
     // Access to command manager
     CommandManager& GetCommandManager() { return commandManager; }
 
-private:
+public:
     CircuitComponent* CreateComponent(ComponentType type, const wxPoint& pos);
+
+private:
     void DrawGrid(wxDC& dc);
     void DrawComponents(wxDC& dc);
     void DrawSelection(wxDC& dc);

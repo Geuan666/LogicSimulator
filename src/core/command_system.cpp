@@ -1,5 +1,7 @@
 #include "../../include/core/command_system.h"
 #include "../../include/ui/circuit_canvas.h"
+#include <algorithm>
+#include <memory>
 
 // AddComponentCommand implementation
 AddComponentCommand::AddComponentCommand(CircuitCanvas* canvas, std::unique_ptr<CircuitComponent> comp)
@@ -9,15 +11,18 @@ void AddComponentCommand::Execute() {
     if (!executed && canvas && component) {
         canvas->AddComponentDirectly(std::move(component));
         executed = true;
-        canvas->Refresh();
     }
 }
 
 void AddComponentCommand::Undo() {
-    if (executed && canvas && component) {
-        canvas->RemoveComponentDirectly(component.get());
-        executed = false;
-        canvas->Refresh();
+    if (executed && canvas) {
+        // Find the component that was added and extract it back
+        const auto& components = canvas->GetComponents();
+        if (!components.empty()) {
+            // Get the last added component (assuming it's the one we added)
+            component = canvas->ExtractComponent(components.back().get());
+            executed = false;
+        }
     }
 }
 
@@ -30,22 +35,16 @@ RemoveComponentCommand::RemoveComponentCommand(CircuitCanvas* canvas, CircuitCom
     : canvas(canvas), executed(false), originalIndex(0) {
 
     if (canvas && comp) {
-        const auto& components = canvas->GetComponents();
-        for (size_t i = 0; i < components.size(); ++i) {
-            if (components[i].get() == comp) {
-                originalIndex = i;
-                component = canvas->ExtractComponent(comp);
-                break;
-            }
-        }
+        // Store the index first, then extract the component
+        originalIndex = canvas->GetComponentIndex(comp);
+        component = canvas->ExtractComponent(comp);
     }
 }
 
 void RemoveComponentCommand::Execute() {
     if (!executed && canvas && component) {
-        canvas->RemoveComponentDirectly(component.get());
+        // Component is already extracted during construction, just mark as executed
         executed = true;
-        canvas->Refresh();
     }
 }
 
@@ -53,7 +52,6 @@ void RemoveComponentCommand::Undo() {
     if (executed && canvas && component) {
         canvas->InsertComponentAt(originalIndex, std::move(component));
         executed = false;
-        canvas->Refresh();
     }
 }
 
@@ -241,7 +239,7 @@ void CommandManager::BeginTransaction(const wxString& description) {
 
 void CommandManager::EndTransaction() {
     if (currentTransaction) {
-        if (currentTransaction->GetDescription() != "") {
+        if (!currentTransaction->GetDescription().IsEmpty()) {
             ExecuteCommand(std::move(currentTransaction));
         }
         currentTransaction.reset();

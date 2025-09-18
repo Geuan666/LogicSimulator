@@ -30,6 +30,10 @@ private:
     void PopulateInputProperties();
     void PopulateOutputProperties();
     void PopulateLogicGateProperties();
+    void PopulateSequentialProperties();    // For flip-flops and latches
+    void PopulateRegisterProperties();       // For registers and counters
+    void PopulateArithmeticProperties();     // For adders and arithmetic units
+    void PopulateMultiplexerProperties();    // For mux/demux components
     void PopulateClockProperties();
     void PopulateDisplayProperties();
     void PopulateDefaultProperties();

@@ -26,6 +26,9 @@ private:
     wxMenuItem* showPropertiesMenuItem;
     wxMenuItem* showLibraryMenuItem;
 
+    // File menu items
+    wxMenu* recentFilesMenu;
+
     // Document and command system
     std::unique_ptr<CircuitDocument> document;
     std::unique_ptr<CommandManager> commandManager;
@@ -60,6 +63,7 @@ public:
     void OnOpenFile(wxCommandEvent& event);
     void OnSaveFile(wxCommandEvent& event);
     void OnSaveAsFile(wxCommandEvent& event);
+    void OnRecentFile(wxCommandEvent& event);
 
     // Edit menu handlers
     void OnUndo(wxCommandEvent& event);
@@ -68,14 +72,20 @@ public:
     void OnPaste(wxCommandEvent& event);
     void OnDelete(wxCommandEvent& event);
 
+    // Document access
+    CircuitDocument* GetDocument() const { return document.get(); }
+
 private:
     void CreateUI();
     void CreateToolbar();
     void CreateMenuBar();
+    void SetupAcceleratorTable();
     void SetupAUI();
+    void InitializeCanvasTools();
     void ApplyTheme(bool isDark = false);
     void UpdateTitle();
     void UpdateMenus();
+    void UpdateRecentFilesMenu();
 
     // Menu IDs
     enum {
@@ -88,7 +98,9 @@ private:
         ID_ZOOM_RESET,
         ID_ZOOM_FIT,
         ID_LIGHT_THEME,
-        ID_DARK_THEME
+        ID_DARK_THEME,
+        ID_SAVEAS,  // Custom ID for Save As
+        ID_RECENT_FILE_START = wxID_HIGHEST + 1000  // Range for recent files
     };
 
     wxDECLARE_EVENT_TABLE();

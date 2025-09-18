@@ -1,8 +1,12 @@
 #include "../../include/ui/logisim_main_frame.h"
 #include "../../include/ui/icon_factory.h"
+#include <wx/clipbrd.h>
+#include <wx/tokenzr.h>
+#include <wx/filename.h>
+#include <wx/log.h>
 
 wxBEGIN_EVENT_TABLE(LogisimMainFrame, wxFrame)
-    EVT_TOOL(wxID_ANY, LogisimMainFrame::OnToolSelected)
+    // Menu events MUST come BEFORE tool events to avoid interception
     EVT_MENU(wxID_FORWARD, LogisimMainFrame::OnSimulate)
     EVT_MENU(wxID_ABOUT, LogisimMainFrame::OnAbout)
     EVT_MENU(wxID_EXIT, LogisimMainFrame::OnExit)
@@ -11,7 +15,8 @@ wxBEGIN_EVENT_TABLE(LogisimMainFrame, wxFrame)
     EVT_MENU(wxID_NEW, LogisimMainFrame::OnNewFile)
     EVT_MENU(wxID_OPEN, LogisimMainFrame::OnOpenFile)
     EVT_MENU(wxID_SAVE, LogisimMainFrame::OnSaveFile)
-    EVT_MENU(wxID_SAVEAS, LogisimMainFrame::OnSaveAsFile)
+    EVT_MENU(ID_SAVEAS, LogisimMainFrame::OnSaveAsFile)
+    EVT_MENU_RANGE(ID_RECENT_FILE_START, ID_RECENT_FILE_START + 10, LogisimMainFrame::OnRecentFile)
 
     // Edit menu events
     EVT_MENU(wxID_UNDO, LogisimMainFrame::OnUndo)
@@ -36,17 +41,30 @@ wxBEGIN_EVENT_TABLE(LogisimMainFrame, wxFrame)
 
     EVT_COMMAND(wxID_ANY, ComponentLibraryPanel::wxEVT_COMPONENT_SELECTED, LogisimMainFrame::OnComponentSelected)
     EVT_COMMAND(wxID_ANY, CircuitCanvas::wxEVT_COMPONENT_SELECTED, LogisimMainFrame::OnCanvasComponentSelected)
+
+    // Toolbar events - using specific range to avoid intercepting menu events
+    EVT_TOOL_RANGE(static_cast<int>(ComponentType::SELECT), static_cast<int>(ComponentType::WIRE), LogisimMainFrame::OnToolSelected)
 wxEND_EVENT_TABLE()
 
 LogisimMainFrame::LogisimMainFrame()
     : wxFrame(nullptr, wxID_ANY, "Enhanced Logic Circuit Simulator",
-              wxDefaultPosition, wxSize(1200, 800)) {
+              wxDefaultPosition, wxSize(1200, 800)),
+      recentFilesMenu(nullptr) {
+
+    // Initialize document
+    document = std::make_unique<CircuitDocument>();
 
     // Initialize UI
     CreateUI();
 
     // Apply default theme
     ApplyTheme(false);
+
+    // Update title to show new document
+    UpdateTitle();
+
+    // Ensure menu events work properly - force event processing
+    wxYield();
 }
 
 LogisimMainFrame::~LogisimMainFrame() {
@@ -62,6 +80,9 @@ void LogisimMainFrame::CreateUI() {
     // Create menu bar
     CreateMenuBar();
 
+    // Setup accelerator table
+    SetupAcceleratorTable();
+
     // Create toolbar
     CreateToolbar();
 
@@ -70,8 +91,19 @@ void LogisimMainFrame::CreateUI() {
     propertiesPanel = new PropertiesPanel(this);
     libraryPanel = new ComponentLibraryPanel(this);
 
+    // Initialize canvas tool AFTER canvas is created
+    InitializeCanvasTools();
+
     // Setup AUI layout
     SetupAUI();
+
+    // Update menu states to match canvas defaults
+    UpdateMenus();
+
+    // Force menu bar update
+    if (GetMenuBar()) {
+        GetMenuBar()->UpdateMenus();
+    }
 }
 
 void LogisimMainFrame::CreateToolbar() {
@@ -132,6 +164,9 @@ void LogisimMainFrame::CreateToolbar() {
                       IconFactory::CreateWireIcon(), "Wire Tool");
 
     toolbar->Realize();
+
+    // Note: Canvas tool initialization moved to after canvas creation
+    wxLogDebug("Toolbar created - canvas tool will be set later");
 }
 
 void LogisimMainFrame::CreateMenuBar() {
@@ -140,8 +175,17 @@ void LogisimMainFrame::CreateMenuBar() {
     // File menu
     wxMenu* fileMenu = new wxMenu;
     fileMenu->Append(wxID_NEW, "&New Circuit\tCtrl+N", "Create a new circuit");
-    fileMenu->Append(wxID_SAVE, "&Save Circuit\tCtrl+S", "Save the current circuit");
     fileMenu->Append(wxID_OPEN, "&Open Circuit\tCtrl+O", "Open a circuit file");
+    fileMenu->AppendSeparator();
+    fileMenu->Append(wxID_SAVE, "&Save Circuit\tCtrl+S", "Save the current circuit");
+    fileMenu->Append(ID_SAVEAS, "Save &As...\tCtrl+Shift+S", "Save the circuit with a new name");
+    fileMenu->AppendSeparator();
+
+    // Recent files submenu
+    recentFilesMenu = new wxMenu;
+    fileMenu->Append(wxID_ANY, "Recent &Files", recentFilesMenu, "Recently opened files");
+    UpdateRecentFilesMenu();
+
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "E&xit\tAlt+F4", "Exit the application");
 
@@ -197,6 +241,36 @@ void LogisimMainFrame::CreateMenuBar() {
     SetMenuBar(menuBar);
 }
 
+void LogisimMainFrame::SetupAcceleratorTable() {
+    // Create accelerator entries for keyboard shortcuts
+    wxAcceleratorEntry entries[15];
+    int entryIndex = 0;
+
+    // File menu shortcuts
+    entries[entryIndex++].Set(wxACCEL_CTRL, (int) 'N', wxID_NEW);
+    entries[entryIndex++].Set(wxACCEL_CTRL, (int) 'O', wxID_OPEN);
+    entries[entryIndex++].Set(wxACCEL_CTRL, (int) 'S', wxID_SAVE);
+    entries[entryIndex++].Set(wxACCEL_CTRL | wxACCEL_SHIFT, (int) 'S', ID_SAVEAS);
+
+    // Edit menu shortcuts
+    entries[entryIndex++].Set(wxACCEL_CTRL, (int) 'Z', wxID_UNDO);
+    entries[entryIndex++].Set(wxACCEL_CTRL, (int) 'Y', wxID_REDO);
+    entries[entryIndex++].Set(wxACCEL_CTRL | wxACCEL_SHIFT, (int) 'Z', wxID_REDO);
+    entries[entryIndex++].Set(wxACCEL_CTRL, (int) 'C', wxID_COPY);
+    entries[entryIndex++].Set(wxACCEL_CTRL, (int) 'V', wxID_PASTE);
+    entries[entryIndex++].Set(wxACCEL_NORMAL, WXK_DELETE, wxID_DELETE);
+
+    // View menu shortcuts
+    entries[entryIndex++].Set(wxACCEL_CTRL, (int) 'G', ID_SHOW_GRID);
+    entries[entryIndex++].Set(wxACCEL_NORMAL, (int) '+', ID_ZOOM_IN);
+    entries[entryIndex++].Set(wxACCEL_NORMAL, (int) '-', ID_ZOOM_OUT);
+    entries[entryIndex++].Set(wxACCEL_NORMAL, (int) '0', ID_ZOOM_RESET);
+    entries[entryIndex++].Set(wxACCEL_NORMAL, (int) 'F', ID_ZOOM_FIT);
+
+    wxAcceleratorTable accel(entryIndex, entries);
+    SetAcceleratorTable(accel);
+}
+
 void LogisimMainFrame::SetupAUI() {
     auiManager.SetManagedWindow(this);
 
@@ -223,6 +297,31 @@ void LogisimMainFrame::SetupAUI() {
                        .BestSize(220, -1));
 
     auiManager.Update();
+
+    // Ensure this frame can receive menu events properly
+    SetCanFocus(true);
+}
+
+void LogisimMainFrame::InitializeCanvasTools() {
+    // This function is called AFTER canvas is created
+    if (!canvas) {
+        wxLogError("InitializeCanvasTools: canvas is null!");
+        return;
+    }
+
+    // Set the SELECT tool as default and toggle it in toolbar
+    wxToolBar* toolbar = GetToolBar();
+    if (toolbar) {
+        toolbar->ToggleTool(static_cast<int>(ComponentType::SELECT), true);
+    }
+
+    // Set tool in canvas
+    canvas->SetTool(ComponentType::SELECT);
+
+    // Update status bar
+    SetStatusText("Select and move components - DRAG MODE ACTIVE");
+
+    wxLogDebug("Canvas tools initialized: SELECT tool set as default");
 }
 
 void LogisimMainFrame::ApplyTheme(bool isDark) {
@@ -246,12 +345,15 @@ void LogisimMainFrame::OnToolSelected(wxCommandEvent& event) {
     int toolId = event.GetId();
     ComponentType tool = static_cast<ComponentType>(toolId);
 
+    // Debug output
+    wxLogDebug("OnToolSelected: toolId=%d, tool=%d", toolId, (int)tool);
+
     canvas->SetTool(tool);
 
     // Update status bar
     switch (tool) {
         case ComponentType::SELECT:
-            SetStatusText("Select and move components");
+            SetStatusText("Select and move components - DRAG MODE ACTIVE");
             break;
         case ComponentType::AND_GATE:
             SetStatusText("Add AND gate");
@@ -318,6 +420,7 @@ void LogisimMainFrame::OnComponentSelected(wxCommandEvent& event) {
 void LogisimMainFrame::OnCanvasComponentSelected(wxCommandEvent& event) {
     CircuitComponent* component = static_cast<CircuitComponent*>(event.GetClientData());
     propertiesPanel->SetComponent(component);
+    UpdateMenus(); // Update menu state when selection changes
 }
 
 void LogisimMainFrame::OnSimulate(wxCommandEvent& event) {
@@ -385,22 +488,22 @@ void LogisimMainFrame::OnShowLibrary(wxCommandEvent& event) {
 
 void LogisimMainFrame::OnZoomIn(wxCommandEvent& event) {
     canvas->ZoomIn();
-    SetStatusText(wxString::Format("Zoom: %.0f%%", canvas->GetZoom() * 100), 1);
+    UpdateMenus(); // Update status bar zoom
 }
 
 void LogisimMainFrame::OnZoomOut(wxCommandEvent& event) {
     canvas->ZoomOut();
-    SetStatusText(wxString::Format("Zoom: %.0f%%", canvas->GetZoom() * 100), 1);
+    UpdateMenus(); // Update status bar zoom
 }
 
 void LogisimMainFrame::OnZoomReset(wxCommandEvent& event) {
     canvas->ResetZoom();
-    SetStatusText("Zoom: 100%", 1);
+    UpdateMenus(); // Update status bar zoom
 }
 
 void LogisimMainFrame::OnZoomFit(wxCommandEvent& event) {
     canvas->FitToWindow();
-    SetStatusText(wxString::Format("Zoom: %.0f%%", canvas->GetZoom() * 100), 1);
+    UpdateMenus(); // Update status bar zoom
 }
 
 // Theme handlers
@@ -433,12 +536,14 @@ void LogisimMainFrame::OnNewFile(wxCommandEvent& event) {
         document->NewDocument();
     }
 
-    // Clear canvas
+    // Clear canvas and command history
     canvas->ClearComponents();
+    canvas->GetCommandManager().Clear();
     canvas->Refresh();
 
     // Update UI
     UpdateTitle();
+    UpdateMenus();
     SetStatusText("New circuit created", 0);
 }
 
@@ -457,6 +562,12 @@ void LogisimMainFrame::OnOpenFile(wxCommandEvent& event) {
 
     if (document->LoadFromFile(filename)) {
         document->LoadToCanvas(canvas);
+        canvas->GetCommandManager().Clear(); // Clear undo/redo history for new file
+
+        // Add to recent files
+        DocumentManager::GetInstance().AddRecentFile(filename);
+        UpdateRecentFilesMenu();
+
         UpdateTitle();
         SetStatusText("Circuit loaded: " + filename, 0);
     } else {
@@ -478,6 +589,12 @@ void LogisimMainFrame::OnSaveFile(wxCommandEvent& event) {
     document->SaveFromCanvas(canvas);
 
     if (document->SaveToFile(document->GetFilename())) {
+        document->SetModified(false); // Mark as not modified after successful save
+
+        // Add to recent files
+        DocumentManager::GetInstance().AddRecentFile(document->GetFilename());
+        UpdateRecentFilesMenu();
+
         UpdateTitle();
         SetStatusText("Circuit saved: " + document->GetFilename(), 0);
     } else {
@@ -502,6 +619,12 @@ void LogisimMainFrame::OnSaveAsFile(wxCommandEvent& event) {
     document->SaveFromCanvas(canvas);
 
     if (document->SaveAs(filename)) {
+        document->SetModified(false); // Mark as not modified after successful save
+
+        // Add to recent files
+        DocumentManager::GetInstance().AddRecentFile(filename);
+        UpdateRecentFilesMenu();
+
         UpdateTitle();
         SetStatusText("Circuit saved as: " + filename, 0);
     } else {
@@ -514,6 +637,7 @@ void LogisimMainFrame::OnUndo(wxCommandEvent& event) {
     if (canvas) {
         canvas->GetCommandManager().Undo();
         canvas->Refresh();
+        UpdateMenus(); // Update menu state after undo
         SetStatusText("Undo completed", 0);
     }
 }
@@ -522,18 +646,79 @@ void LogisimMainFrame::OnRedo(wxCommandEvent& event) {
     if (canvas) {
         canvas->GetCommandManager().Redo();
         canvas->Refresh();
+        UpdateMenus(); // Update menu state after redo
         SetStatusText("Redo completed", 0);
     }
 }
 
 void LogisimMainFrame::OnCopy(wxCommandEvent& event) {
-    // TODO: Implement clipboard copy functionality
-    SetStatusText("Copy functionality not yet implemented", 0);
+    if (canvas && canvas->GetSelectedComponent()) {
+        // Store the selected component type and position for copy/paste
+        CircuitComponent* selected = canvas->GetSelectedComponent();
+        ComponentType type = selected->GetType();
+        wxPoint pos = selected->GetPosition();
+
+        // Save to clipboard as string representation
+        wxString clipboardData = wxString::Format("%d,%d,%d",
+            static_cast<int>(type), pos.x, pos.y);
+
+        if (wxTheClipboard->Open()) {
+            wxTheClipboard->SetData(new wxTextDataObject(clipboardData));
+            wxTheClipboard->Close();
+            SetStatusText("Component copied to clipboard", 0);
+        } else {
+            SetStatusText("Failed to access clipboard", 0);
+        }
+    } else {
+        SetStatusText("No component selected to copy", 0);
+    }
 }
 
 void LogisimMainFrame::OnPaste(wxCommandEvent& event) {
-    // TODO: Implement clipboard paste functionality
-    SetStatusText("Paste functionality not yet implemented", 0);
+    if (wxTheClipboard->Open()) {
+        if (wxTheClipboard->IsSupported(wxDF_TEXT)) {
+            wxTextDataObject data;
+            wxTheClipboard->GetData(data);
+            wxString clipboardText = data.GetText();
+
+            // Parse clipboard data
+            wxStringTokenizer tokenizer(clipboardText, ",");
+            if (tokenizer.CountTokens() == 3) {
+                long typeValue, x, y;
+                if (tokenizer.GetNextToken().ToLong(&typeValue) &&
+                    tokenizer.GetNextToken().ToLong(&x) &&
+                    tokenizer.GetNextToken().ToLong(&y)) {
+
+                    ComponentType type = static_cast<ComponentType>(typeValue);
+
+                    // Offset the paste position slightly to avoid overlap
+                    wxPoint pastePos(x + 20, y + 20);
+
+                    // Directly create and add the component using canvas methods
+                    CircuitComponent* newComponent = canvas->CreateComponent(type, pastePos);
+                    if (newComponent) {
+                        auto addCommand = std::make_unique<AddComponentCommand>(canvas,
+                            std::unique_ptr<CircuitComponent>(newComponent));
+                        canvas->GetCommandManager().ExecuteCommand(std::move(addCommand));
+                        canvas->SelectComponent(newComponent);
+                        canvas->Refresh();
+                        SetStatusText("Component pasted", 0);
+                    } else {
+                        SetStatusText("Failed to create component", 0);
+                    }
+                } else {
+                    SetStatusText("Invalid clipboard data format", 0);
+                }
+            } else {
+                SetStatusText("No valid component data in clipboard", 0);
+            }
+        } else {
+            SetStatusText("No text data in clipboard", 0);
+        }
+        wxTheClipboard->Close();
+    } else {
+        SetStatusText("Failed to access clipboard", 0);
+    }
 }
 
 void LogisimMainFrame::OnDelete(wxCommandEvent& event) {
@@ -560,4 +745,108 @@ void LogisimMainFrame::UpdateTitle() {
     }
 
     SetTitle(title);
+}
+
+void LogisimMainFrame::UpdateRecentFilesMenu() {
+    if (!recentFilesMenu) return;
+
+    // Clear existing items
+    while (recentFilesMenu->GetMenuItemCount() > 0) {
+        recentFilesMenu->Delete(recentFilesMenu->FindItemByPosition(0));
+    }
+
+    // Add recent files
+    const auto& recentFiles = DocumentManager::GetInstance().GetRecentFiles();
+
+    if (recentFiles.empty()) {
+        recentFilesMenu->Append(wxID_ANY, "(No recent files)", "", wxITEM_NORMAL);
+        recentFilesMenu->Enable(recentFilesMenu->FindItemByPosition(0)->GetId(), false);
+    } else {
+        for (size_t i = 0; i < recentFiles.size(); ++i) {
+            wxString filename = wxFileName(recentFiles[i]).GetFullName();
+            wxString menuText = wxString::Format("&%zu %s", i + 1, filename);
+            recentFilesMenu->Append(ID_RECENT_FILE_START + i, menuText, recentFiles[i]);
+        }
+
+        recentFilesMenu->AppendSeparator();
+        recentFilesMenu->Append(wxID_ANY, "&Clear Recent Files", "Clear the recent files list");
+
+        // Bind the clear recent files event
+        Bind(wxEVT_COMMAND_MENU_SELECTED,
+             [this](wxCommandEvent&) {
+                 DocumentManager::GetInstance().ClearRecentFiles();
+                 UpdateRecentFilesMenu();
+                 SetStatusText("Recent files cleared", 0);
+             },
+             recentFilesMenu->GetMenuItems().back()->GetId());
+    }
+}
+
+void LogisimMainFrame::OnRecentFile(wxCommandEvent& event) {
+    int fileIndex = event.GetId() - ID_RECENT_FILE_START;
+    const auto& recentFiles = DocumentManager::GetInstance().GetRecentFiles();
+
+    if (fileIndex >= 0 && fileIndex < static_cast<int>(recentFiles.size())) {
+        wxString filename = recentFiles[fileIndex];
+
+        // Check if current document is modified
+        if (document && document->IsModified()) {
+            int result = wxMessageBox("The current circuit has been modified. Do you want to save it?",
+                                     "Save Changes", wxYES_NO | wxCANCEL | wxICON_QUESTION, this);
+            if (result == wxCANCEL) return;
+            if (result == wxYES) {
+                wxCommandEvent saveEvent;
+                OnSaveFile(saveEvent);
+            }
+        }
+
+        // Load the recent file
+        if (!document) {
+            document = std::make_unique<CircuitDocument>();
+        }
+
+        if (document->LoadFromFile(filename)) {
+            document->LoadToCanvas(canvas);
+            canvas->GetCommandManager().Clear();
+            UpdateTitle();
+            SetStatusText("Loaded recent file: " + filename, 0);
+        } else {
+            wxMessageBox("Failed to load recent file: " + filename, "Error", wxOK | wxICON_ERROR, this);
+            // Note: Cannot directly modify the recent files vector as GetRecentFiles() returns const reference
+            // The DocumentManager should handle invalid file removal internally
+            UpdateRecentFilesMenu();
+        }
+    }
+}
+
+void LogisimMainFrame::UpdateMenus() {
+    if (!canvas) return;
+
+    // Update view menu items to match canvas state
+    if (showGridMenuItem) {
+        showGridMenuItem->Check(canvas->GetShowGrid());
+    }
+    if (snapToGridMenuItem) {
+        snapToGridMenuItem->Check(canvas->GetSnapToGrid());
+    }
+
+    // Update panel visibility menu items
+    if (showPropertiesMenuItem) {
+        showPropertiesMenuItem->Check(auiManager.GetPane("properties").IsShown());
+    }
+    if (showLibraryMenuItem) {
+        showLibraryMenuItem->Check(auiManager.GetPane("library").IsShown());
+    }
+
+    // Update Edit menu items based on command manager state
+    wxMenuBar* menuBar = GetMenuBar();
+    if (menuBar) {
+        menuBar->Enable(wxID_UNDO, canvas->GetCommandManager().CanUndo());
+        menuBar->Enable(wxID_REDO, canvas->GetCommandManager().CanRedo());
+        menuBar->Enable(wxID_DELETE, canvas->GetSelectedComponent() != nullptr);
+        menuBar->Enable(wxID_COPY, canvas->GetSelectedComponent() != nullptr);
+    }
+
+    // Update status bar with current zoom
+    SetStatusText(wxString::Format("Zoom: %.0f%%", canvas->GetZoom() * 100), 1);
 }
